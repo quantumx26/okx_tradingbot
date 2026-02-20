@@ -31,7 +31,7 @@ class OKXTrader:
 
     def __init__(self):
         self.api_key = os.getenv('OKX_API_KEY')
-        self.secret = os.getenv('OKX_SECRET')
+        self.secret = os.getenv('OKX_SECRET_KEY')
         self.passphrase = os.getenv('OKX_PASSPHRASE')
         self.demo = os.getenv('OKX_DEMO', 'true').lower() == 'true'
 
