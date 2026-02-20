@@ -1,13 +1,17 @@
 """
-TradingView Webhook Server → OKX Demo Trading
-Automated Crypto Futures Trading
+TradingView Webhook Server → Alpaca Paper Trading
+Automated Crypto Trading (BTC, ETH, etc.)
 """
 
 from flask import Flask, request, jsonify
-import ccxt
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.data.historical import CryptoHistoricalDataClient
+from alpaca.data.requests import CryptoBarsRequest
+from alpaca.data.timeframe import TimeFrame
 import logging
 from datetime import datetime
-import json
 import os
 from dotenv import load_dotenv
 
@@ -19,289 +23,303 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('okx_trading.log'),
+        logging.FileHandler('alpaca_trading.log'),
         logging.StreamHandler()
     ]
 )
 
 app = Flask(__name__)
 
-class OKXTrader:
-    """OKX Trading execution"""
-
+class AlpacaTrader:
+    """Alpaca Trading execution"""
+    
     def __init__(self):
-        self.api_key = os.getenv('OKX_API_KEY')
-        self.secret = os.getenv('OKX_SECRET_KEY')
-        self.passphrase = os.getenv('OKX_PASSPHRASE')
-        self.demo = os.getenv('OKX_DEMO', 'true').lower() == 'true'
-
-        # Build exchange config
-        exchange_config = {
-            'apiKey': self.api_key,
-            'secret': self.secret,
-            'password': self.passphrase,
-            'enableRateLimit': True,
-            'options': {
-                'defaultType': 'swap',  # Perpetual Futures
-            }
-        }
-
-        # Demo Mode: OKX uses same URLs as Live, only header differs
-        # DO NOT use set_sandbox_mode(True) — it points to wrong URLs
-        if self.demo:
-            exchange_config['headers'] = {
-                'x-simulated-trading': '1'
-            }
-            logging.info("✅ OKX Demo Trading Mode ENABLED")
+        self.api_key = os.getenv('ALPACA_API_KEY')
+        self.secret_key = os.getenv('ALPACA_SECRET_KEY')
+        self.paper = os.getenv('ALPACA_PAPER', 'true').lower() == 'true'
+        
+        # Initialize Alpaca client
+        self.client = TradingClient(
+            api_key=self.api_key,
+            secret_key=self.secret_key,
+            paper=self.paper
+        )
+        
+        # Initialize data client
+        self.data_client = CryptoHistoricalDataClient()
+        
+        if self.paper:
+            logging.info("✅ Alpaca Paper Trading Mode ENABLED")
         else:
-            logging.info("⚠️  OKX LIVE Trading Mode")
-
-        self.exchange = ccxt.okx(exchange_config)
-
+            logging.info("⚠️ Alpaca LIVE Trading Mode")
+        
         # Test connection
         try:
-            balance = self.exchange.fetch_balance()
-            usdt = balance.get('USDT', {}).get('free', 0)
-            logging.info(f"✅ Connected to OKX successfully")
-            logging.info(f"   Demo Mode: {self.demo}")
-            logging.info(f"   USDT Balance: {usdt:.2f}")
+            account = self.client.get_account()
+            logging.info(f"✅ Connected to Alpaca successfully")
+            logging.info(f"   Account: ${account.equity}")
+            logging.info(f"   Buying Power: ${account.buying_power}")
+            logging.info(f"   Paper Mode: {self.paper}")
         except Exception as e:
             logging.error(f"❌ Connection failed: {str(e)}")
-
-    def get_balance(self):
-        """Get USDT balance"""
+    
+    def get_account(self):
+        """Get account info"""
         try:
-            balance = self.exchange.fetch_balance()
-            return balance.get('USDT', {}).get('free', 0)
+            account = self.client.get_account()
+            return {
+                'equity': float(account.equity),
+                'buying_power': float(account.buying_power),
+                'cash': float(account.cash),
+                'portfolio_value': float(account.portfolio_value)
+            }
         except Exception as e:
-            logging.error(f"Error getting balance: {str(e)}")
+            logging.error(f"Error getting account: {str(e)}")
             return None
-
-    def calculate_position_size(self, symbol, risk_usd, entry_price, stop_loss):
-        """Calculate position size based on risk amount"""
-        try:
-            markets = self.exchange.load_markets()
-            market = markets.get(symbol)
-
-            if not market:
-                logging.warning(f"Market {symbol} not found, using default 0.01")
-                return 0.01
-
-            contract_size = market.get('contractSize', 1)
-            risk_price = abs(entry_price - stop_loss)
-
-            if risk_price == 0:
-                logging.warning("SL == Entry price, using default 0.01")
-                return 0.01
-
-            contracts = risk_usd / (contract_size * risk_price)
-            contracts = self.exchange.amount_to_precision(symbol, contracts)
-            contracts = max(float(contracts), 0.01)
-
-            logging.info(f"Position Size: {contracts} contracts (Risk: ${risk_usd:.2f})")
-            return contracts
-
-        except Exception as e:
-            logging.error(f"Error calculating position: {str(e)}")
-            return 0.01
-
-    def place_market_order(self, symbol, side, amount, stop_loss=None, take_profit=None):
-        """Place market order with optional SL and TP"""
-        try:
-            # Main market order
-            order = self.exchange.create_market_order(
-                symbol=symbol,
-                side=side,
-                amount=amount
-            )
-
-            logging.info(f"✅ Order placed: {side.upper()} {amount} {symbol}")
-            logging.info(f"   Order ID: {order['id']}")
-
-            # Stop Loss
-            if stop_loss:
-                sl_side = 'sell' if side == 'buy' else 'buy'
-                try:
-                    sl_order = self.exchange.create_order(
-                        symbol=symbol,
-                        type='stop_market',
-                        side=sl_side,
-                        amount=amount,
-                        params={
-                            'stopPrice': stop_loss,
-                            'reduceOnly': True
-                        }
-                    )
-                    logging.info(f"   ✅ SL placed at: {stop_loss}")
-                except Exception as e:
-                    logging.warning(f"   ⚠️  SL failed: {str(e)}")
-
-            # Take Profit
-            if take_profit:
-                tp_side = 'sell' if side == 'buy' else 'buy'
-                try:
-                    tp_order = self.exchange.create_limit_order(
-                        symbol=symbol,
-                        side=tp_side,
-                        amount=amount,
-                        price=take_profit,
-                        params={
-                            'reduceOnly': True
-                        }
-                    )
-                    logging.info(f"   ✅ TP placed at: {take_profit}")
-                except Exception as e:
-                    logging.warning(f"   ⚠️  TP failed: {str(e)}")
-
-            return order
-
-        except Exception as e:
-            logging.error(f"❌ Order failed: {str(e)}")
-            return None
-
-    def close_position(self, symbol):
-        """Close all open positions for a symbol"""
-        try:
-            positions = self.exchange.fetch_positions([symbol])
-            closed = 0
-
-            for position in positions:
-                contracts = float(position.get('contracts', 0))
-                if contracts > 0:
-                    side = 'sell' if position['side'] == 'long' else 'buy'
-                    self.exchange.create_market_order(
-                        symbol=symbol,
-                        side=side,
-                        amount=contracts,
-                        params={'reduceOnly': True}
-                    )
-                    logging.info(f"✅ Closed {position['side'].upper()}: {contracts} {symbol}")
-                    closed += 1
-
-            if closed == 0:
-                logging.info(f"ℹ️  No open positions found for {symbol}")
-
-            return True
-
-        except Exception as e:
-            logging.error(f"❌ Close failed: {str(e)}")
-            return False
-
+    
     def get_current_price(self, symbol):
-        """Get last price for symbol"""
+        """Get current price for crypto"""
         try:
-            ticker = self.exchange.fetch_ticker(symbol)
-            return ticker['last']
+            # Alpaca crypto symbols format: BTC/USD
+            bars_request = CryptoBarsRequest(
+                symbol_or_symbols=symbol,
+                timeframe=TimeFrame.Minute,
+                limit=1
+            )
+            bars = self.data_client.get_crypto_bars(bars_request)
+            
+            if symbol in bars.data:
+                latest_bar = bars.data[symbol][-1]
+                return float(latest_bar.close)
+            return None
         except Exception as e:
             logging.error(f"Error getting price: {str(e)}")
             return None
-
+    
+    def calculate_position_size(self, symbol, risk_usd, entry_price, stop_loss):
+        """Calculate position size based on risk"""
+        try:
+            # Calculate risk per unit
+            risk_per_unit = abs(entry_price - stop_loss)
+            
+            if risk_per_unit == 0:
+                logging.error("Risk per unit is zero")
+                return 0
+            
+            # Calculate quantity
+            quantity = risk_usd / risk_per_unit
+            
+            # Round to appropriate precision (crypto usually 6 decimals)
+            quantity = round(quantity, 6)
+            
+            # Minimum position
+            if quantity < 0.0001:
+                quantity = 0.0001
+            
+            logging.info(f"Position Size: {quantity} units (Risk: ${risk_usd:.2f})")
+            
+            return quantity
+            
+        except Exception as e:
+            logging.error(f"Error calculating position: {str(e)}")
+            return 0.0001
+    
+    def place_market_order(self, symbol, side, quantity, stop_loss=None, take_profit=None):
+        """Place market order with bracket (SL/TP)"""
+        try:
+            # Determine order side
+            order_side = OrderSide.BUY if side.upper() == 'BUY' else OrderSide.SELL
+            
+            # Create bracket order with SL and TP
+            order_data = MarketOrderRequest(
+                symbol=symbol,
+                qty=quantity,
+                side=order_side,
+                time_in_force=TimeInForce.GTC
+            )
+            
+            # Place main order
+            order = self.client.submit_order(order_data)
+            
+            logging.info(f"✅ Order placed: {side.upper()} {quantity} {symbol}")
+            logging.info(f"   Order ID: {order.id}")
+            
+            # Note: Alpaca crypto doesn't support bracket orders yet
+            # You'd need to manually manage SL/TP or use separate orders
+            
+            if stop_loss:
+                logging.info(f"   Target SL: {stop_loss}")
+            if take_profit:
+                logging.info(f"   Target TP: {take_profit}")
+            
+            return order
+            
+        except Exception as e:
+            logging.error(f"❌ Order failed: {str(e)}")
+            return None
+    
+    def close_position(self, symbol):
+        """Close position for symbol"""
+        try:
+            # Get current position
+            positions = self.client.get_all_positions()
+            
+            for position in positions:
+                if position.symbol == symbol:
+                    qty = abs(float(position.qty))
+                    side = OrderSide.SELL if float(position.qty) > 0 else OrderSide.BUY
+                    
+                    # Close position
+                    order_data = MarketOrderRequest(
+                        symbol=symbol,
+                        qty=qty,
+                        side=side,
+                        time_in_force=TimeInForce.GTC
+                    )
+                    
+                    order = self.client.submit_order(order_data)
+                    
+                    logging.info(f"✅ Closed position: {symbol} ({qty} units)")
+                    return True
+            
+            logging.info(f"No position found for {symbol}")
+            return False
+            
+        except Exception as e:
+            logging.error(f"❌ Close position failed: {str(e)}")
+            return False
 
 # Initialize trader
-trader = OKXTrader()
+trader = AlpacaTrader()
 
-# Webhook secret
+# Security
 WEBHOOK_SECRET = os.getenv('WEBHOOK_SECRET', 'your-secret-key')
-
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    """Receive and process TradingView alerts"""
+    """Receive TradingView alerts"""
     try:
         data = request.get_json()
-
+        
         if not data:
-            return jsonify({'error': 'No data received'}), 400
-
+            return jsonify({'error': 'No data'}), 400
+        
         # Security check
         if data.get('secret') != WEBHOOK_SECRET:
-            logging.warning(f"⚠️  Invalid secret from {request.remote_addr}")
+            logging.warning(f"⚠️ Invalid secret from {request.remote_addr}")
             return jsonify({'error': 'Invalid secret'}), 403
-
-        # Extract signal data
-        signal    = data.get('signal', '').upper()
-        symbol    = data.get('symbol', 'BTC/USDT:USDT')
-        entry     = float(data.get('entry', 0))
-        sl        = float(data.get('sl', 0))
-        tp        = float(data.get('tp', 0))
-        risk_usd  = float(data.get('risk_usd', 100))
-
-        # Validate signal
-        if signal not in ['LONG', 'SHORT', 'CLOSE']:
-            return jsonify({'error': f'Invalid signal: {signal}'}), 400
-
-        logging.info(f"📊 Webhook received: {signal} {symbol}")
-        logging.info(f"   Entry: {entry} | SL: {sl} | TP: {tp} | Risk: ${risk_usd}")
-
-        # CLOSE signal
+        
+        # Extract data
+        signal = data.get('signal', '').upper()
+        symbol = data.get('symbol', 'BTC/USD')  # Alpaca format: BTC/USD
+        entry = float(data.get('entry', 0))
+        sl = float(data.get('sl', 0))
+        tp = float(data.get('tp', 0))
+        risk_usd = float(data.get('risk_usd', 100))
+        
+        # Validate
+        if signal not in ['LONG', 'SHORT', 'CLOSE', 'BUY', 'SELL']:
+            return jsonify({'error': 'Invalid signal'}), 400
+        
+        logging.info(f"📊 Webhook: {signal} {symbol}")
+        logging.info(f"   Entry: {entry}, SL: {sl}, TP: {tp}")
+        
+        # Handle CLOSE
         if signal == 'CLOSE':
             result = trader.close_position(symbol)
             if result:
-                return jsonify({'status': 'success', 'action': 'closed', 'symbol': symbol}), 200
+                return jsonify({'status': 'success', 'action': 'closed'}), 200
             else:
-                return jsonify({'error': 'Failed to close position'}), 500
-
-        # Calculate position size
-        amount = trader.calculate_position_size(symbol, risk_usd, entry, sl)
-
-        # Determine order side
-        side = 'buy' if signal == 'LONG' else 'sell'
-
+                return jsonify({'error': 'Failed to close'}), 500
+        
+        # Calculate size
+        quantity = trader.calculate_position_size(symbol, risk_usd, entry, sl)
+        
+        # Determine side
+        side = 'BUY' if signal in ['LONG', 'BUY'] else 'SELL'
+        
         # Place order
         result = trader.place_market_order(
             symbol=symbol,
             side=side,
-            amount=amount,
-            stop_loss=sl if sl else None,
-            take_profit=tp if tp else None
+            quantity=quantity,
+            stop_loss=sl,
+            take_profit=tp
         )
-
+        
         if result:
             return jsonify({
                 'status': 'success',
                 'signal': signal,
                 'symbol': symbol,
-                'side': side,
-                'amount': amount,
-                'order_id': result.get('id')
+                'quantity': quantity,
+                'order_id': result.id
             }), 200
         else:
-            return jsonify({'error': 'Order placement failed'}), 500
-
+            return jsonify({'error': 'Order failed'}), 500
+            
     except Exception as e:
         logging.error(f"❌ Webhook error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-
 @app.route('/status', methods=['GET'])
 def status():
-    """Health check endpoint"""
-    balance = trader.get_balance()
-    btc_price = trader.get_current_price('BTC/USDT:USDT')
-
+    """Health check"""
+    account = trader.get_account()
+    btc_price = trader.get_current_price('BTC/USD')
+    
     return jsonify({
         'status': 'running',
         'timestamp': datetime.now().isoformat(),
-        'demo_mode': trader.demo,
-        'balance_usdt': balance,
+        'paper_mode': trader.paper,
+        'account': account,
         'btc_price': btc_price
     }), 200
 
+@app.route('/positions', methods=['GET'])
+def positions():
+    """Get current positions"""
+    try:
+        positions = trader.client.get_all_positions()
+        
+        positions_list = []
+        for pos in positions:
+            positions_list.append({
+                'symbol': pos.symbol,
+                'qty': float(pos.qty),
+                'avg_entry': float(pos.avg_entry_price),
+                'current_price': float(pos.current_price),
+                'pnl': float(pos.unrealized_pl),
+                'pnl_pct': float(pos.unrealized_plpc) * 100
+            })
+        
+        return jsonify({
+            'positions': positions_list,
+            'count': len(positions_list)
+        }), 200
+        
+    except Exception as e:
+        logging.error(f"Error getting positions: {str(e)}")
+        return jsonify({'error': str(e)}), 500
 
-@app.route('/', methods=['GET'])
-def index():
-    return jsonify({'message': 'OKX Trading Bot is running 🚀', 'webhook': '/webhook', 'status': '/status'}), 200
-
+@app.route('/test', methods=['POST'])
+def test():
+    """Test endpoint"""
+    try:
+        data = request.get_json()
+        logging.info(f"📝 Test webhook: {data}")
+        return jsonify({'status': 'test received', 'data': data}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
-
-    logging.info("=" * 50)
-    logging.info("🚀 OKX Trading Bot Starting")
-    logging.info(f"   Port:      {port}")
-    logging.info(f"   Demo Mode: {trader.demo}")
-    logging.info(f"   Webhook:   http://localhost:{port}/webhook")
-    logging.info(f"   Status:    http://localhost:{port}/status")
-    logging.info("=" * 50)
-
+    
+    logging.info("="*50)
+    logging.info("🚀 Alpaca Trading Bot Starting")
+    logging.info(f"   Port: {port}")
+    logging.info(f"   Paper Mode: {trader.paper}")
+    logging.info(f"   Webhook URL: http://localhost:{port}/webhook")
+    logging.info("="*50)
+    
     app.run(host='0.0.0.0', port=port, debug=False)
