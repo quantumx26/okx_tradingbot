@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Binance Futures Webhook Server for TradingView Alerts
+Bybit Futures Webhook Server for TradingView Alerts
 Supports: LONG + SHORT, Testnet & Live, Position Sizing, SL/TP Management
 """
 
@@ -9,8 +9,7 @@ import sys
 import logging
 from datetime import datetime
 from flask import Flask, request, jsonify
-from binance.client import Client
-from binance.exceptions import BinanceAPIException
+from pybit.unified_trading import HTTP
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -21,7 +20,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('binance_trading.log'),
+        logging.FileHandler('bybit_trading.log'),
         logging.StreamHandler(sys.stdout)
     ]
 )
@@ -30,51 +29,68 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-class BinanceTrader:
+class BybitTrader:
     def __init__(self):
-        """Initialize Binance client with API credentials"""
-        self.api_key = os.getenv('BINANCE_API_KEY')
-        self.api_secret = os.getenv('BINANCE_SECRET_KEY')
-        self.testnet = os.getenv('BINANCE_TESTNET', 'true').lower() == 'true'
+        """Initialize Bybit client with API credentials"""
+        self.api_key = os.getenv('BYBIT_API_KEY')
+        self.api_secret = os.getenv('BYBIT_SECRET_KEY')
+        self.testnet = os.getenv('BYBIT_TESTNET', 'true').lower() == 'true'
         self.webhook_secret = os.getenv('WEBHOOK_SECRET')
         
         if not all([self.api_key, self.api_secret, self.webhook_secret]):
             logger.error("❌ Missing required environment variables!")
-            raise ValueError("BINANCE_API_KEY, BINANCE_SECRET_KEY, and WEBHOOK_SECRET must be set")
+            raise ValueError("BYBIT_API_KEY, BYBIT_SECRET_KEY, and WEBHOOK_SECRET must be set")
         
-        # Initialize Binance client
+        # Initialize Bybit client
         try:
             if self.testnet:
-                logger.info("🧪 Binance TESTNET Mode ENABLED")
-                self.client = Client(
-                    self.api_key, 
-                    self.api_secret,
-                    testnet=True
+                logger.info("🧪 Bybit TESTNET Mode ENABLED")
+                self.client = HTTP(
+                    testnet=True,
+                    api_key=self.api_key,
+                    api_secret=self.api_secret
                 )
-                # Set testnet URL
-                self.client.API_URL = 'https://testnet.binancefuture.com'
             else:
-                logger.info("💰 Binance LIVE Mode ENABLED")
-                self.client = Client(self.api_key, self.api_secret)
+                logger.info("💰 Bybit LIVE Mode ENABLED")
+                self.client = HTTP(
+                    testnet=False,
+                    api_key=self.api_key,
+                    api_secret=self.api_secret
+                )
             
             # Test connection
-            account = self.client.futures_account()
-            balance = float(account['totalWalletBalance'])
+            balance = self.get_account_info()
             
-            logger.info("✅ Connected to Binance successfully")
-            logger.info(f"   Account Balance: ${balance:.2f} USDT")
+            logger.info("✅ Connected to Bybit successfully")
+            logger.info(f"   Account Balance: ${balance['balance']:.2f} USDT")
+            logger.info(f"   Available: ${balance['available']:.2f} USDT")
             logger.info(f"   Testnet: {self.testnet}")
             
         except Exception as e:
-            logger.error(f"❌ Failed to connect to Binance: {e}")
+            logger.error(f"❌ Failed to connect to Bybit: {e}")
             raise
     
     def get_account_info(self):
         """Get account balance and info"""
         try:
-            account = self.client.futures_account()
-            balance = float(account['totalWalletBalance'])
-            available = float(account['availableBalance'])
+            response = self.client.get_wallet_balance(
+                accountType="UNIFIED"
+            )
+            
+            if response['retCode'] != 0:
+                logger.error(f"❌ Error getting balance: {response['retMsg']}")
+                return None
+            
+            # Get USDT balance
+            coins = response['result']['list'][0]['coin']
+            usdt_balance = next((c for c in coins if c['coin'] == 'USDT'), None)
+            
+            if usdt_balance:
+                balance = float(usdt_balance['walletBalance'])
+                available = float(usdt_balance['availableToWithdraw'])
+            else:
+                balance = 0.0
+                available = 0.0
             
             return {
                 'balance': balance,
@@ -83,15 +99,24 @@ class BinanceTrader:
             }
         except Exception as e:
             logger.error(f"❌ Error getting account info: {e}")
-            return None
+            return {'balance': 0, 'available': 0, 'testnet': self.testnet}
     
     def get_current_price(self, symbol):
         """Get current market price for symbol"""
         try:
-            ticker = self.client.futures_symbol_ticker(symbol=symbol)
-            return float(ticker['price'])
+            response = self.client.get_tickers(
+                category="linear",
+                symbol=symbol
+            )
+            
+            if response['retCode'] == 0 and response['result']['list']:
+                return float(response['result']['list'][0]['lastPrice'])
+            
+            logger.error(f"❌ Error getting price for {symbol}")
+            return None
+            
         except Exception as e:
-            logger.error(f"❌ Error getting price for {symbol}: {e}")
+            logger.error(f"❌ Error getting price: {e}")
             return None
     
     def calculate_position_size(self, symbol, entry_price, stop_loss, risk_usd):
@@ -109,15 +134,25 @@ class BinanceTrader:
         """
         try:
             # Get symbol info for precision
-            exchange_info = self.client.futures_exchange_info()
-            symbol_info = next((s for s in exchange_info['symbols'] if s['symbol'] == symbol), None)
+            response = self.client.get_instruments_info(
+                category="linear",
+                symbol=symbol
+            )
             
-            if not symbol_info:
+            if response['retCode'] != 0:
                 logger.error(f"❌ Symbol {symbol} not found")
                 return None
             
-            # Get precision
-            quantity_precision = symbol_info['quantityPrecision']
+            instrument = response['result']['list'][0]
+            
+            # Get qty step (precision)
+            qty_step = float(instrument['lotSizeFilter']['qtyStep'])
+            
+            # Determine precision from qty_step
+            if '.' in str(qty_step):
+                precision = len(str(qty_step).split('.')[1].rstrip('0'))
+            else:
+                precision = 0
             
             # Calculate risk per unit
             risk_per_unit = abs(entry_price - stop_loss)
@@ -130,15 +165,13 @@ class BinanceTrader:
             position_size = risk_usd / risk_per_unit
             
             # Round to symbol precision
-            position_size = round(position_size, quantity_precision)
+            position_size = round(position_size, precision)
             
-            # Check minimum notional
-            min_notional = 5.0  # Binance minimum ~$5
-            notional_value = position_size * entry_price
-            
-            if notional_value < min_notional:
-                logger.warning(f"⚠️ Position too small (${notional_value:.2f}), adjusting to minimum")
-                position_size = round(min_notional / entry_price, quantity_precision)
+            # Check minimum order qty
+            min_qty = float(instrument['lotSizeFilter']['minOrderQty'])
+            if position_size < min_qty:
+                logger.warning(f"⚠️ Position too small, adjusting to minimum: {min_qty}")
+                position_size = min_qty
             
             logger.info(f"📊 Position Size: {position_size} {symbol}")
             logger.info(f"   Notional Value: ${position_size * entry_price:.2f}")
@@ -178,7 +211,7 @@ class BinanceTrader:
                 return None
             
             # Determine side
-            side = 'BUY' if signal == 'LONG' else 'SELL'
+            side = 'Buy' if signal == 'LONG' else 'Sell'
             
             logger.info(f"📊 Placing {signal} order for {symbol}")
             logger.info(f"   Side: {side}")
@@ -187,74 +220,63 @@ class BinanceTrader:
             logger.info(f"   Stop Loss: ${sl:.2f}")
             logger.info(f"   Take Profit: ${tp:.2f}")
             
-            # Close any existing positions for this symbol first
+            # Close any existing positions first
             try:
-                positions = self.client.futures_position_information(symbol=symbol)
-                for pos in positions:
-                    pos_amt = float(pos['positionAmt'])
-                    if pos_amt != 0:
-                        close_side = 'SELL' if pos_amt > 0 else 'BUY'
-                        logger.info(f"📤 Closing existing position: {abs(pos_amt)} {symbol}")
-                        self.client.futures_create_order(
-                            symbol=symbol,
-                            side=close_side,
-                            type='MARKET',
-                            quantity=abs(pos_amt)
-                        )
+                positions = self.client.get_positions(
+                    category="linear",
+                    symbol=symbol
+                )
+                
+                if positions['retCode'] == 0:
+                    for pos in positions['result']['list']:
+                        pos_size = float(pos['size'])
+                        if pos_size > 0:
+                            close_side = 'Sell' if pos['side'] == 'Buy' else 'Buy'
+                            logger.info(f"📤 Closing existing position: {pos_size} {symbol}")
+                            
+                            self.client.place_order(
+                                category="linear",
+                                symbol=symbol,
+                                side=close_side,
+                                orderType="Market",
+                                qty=str(pos_size),
+                                reduceOnly=True
+                            )
             except Exception as e:
                 logger.warning(f"⚠️ Error checking/closing positions: {e}")
             
-            # Place market entry order
-            order = self.client.futures_create_order(
+            # Place market entry order with SL and TP
+            order = self.client.place_order(
+                category="linear",
                 symbol=symbol,
                 side=side,
-                type='MARKET',
-                quantity=position_size
+                orderType="Market",
+                qty=str(position_size),
+                stopLoss=str(sl),
+                takeProfit=str(tp)
             )
             
-            logger.info(f"✅ Entry order placed: {order['orderId']}")
+            if order['retCode'] == 0:
+                logger.info(f"✅ Entry order placed: {order['result']['orderId']}")
+                logger.info(f"✅ Stop Loss set at ${sl:.2f}")
+                logger.info(f"✅ Take Profit set at ${tp:.2f}")
+                
+                return {
+                    'entry_order': order['result'],
+                    'position_size': position_size,
+                    'entry_price': current_price
+                }
+            else:
+                logger.error(f"❌ Order failed: {order['retMsg']}")
+                return None
             
-            # Place stop loss order
-            sl_side = 'SELL' if signal == 'LONG' else 'BUY'
-            sl_order = self.client.futures_create_order(
-                symbol=symbol,
-                side=sl_side,
-                type='STOP_MARKET',
-                stopPrice=sl,
-                closePosition=True
-            )
-            
-            logger.info(f"✅ Stop Loss set at ${sl:.2f}")
-            
-            # Place take profit order
-            tp_order = self.client.futures_create_order(
-                symbol=symbol,
-                side=sl_side,
-                type='TAKE_PROFIT_MARKET',
-                stopPrice=tp,
-                closePosition=True
-            )
-            
-            logger.info(f"✅ Take Profit set at ${tp:.2f}")
-            
-            return {
-                'entry_order': order,
-                'sl_order': sl_order,
-                'tp_order': tp_order,
-                'position_size': position_size,
-                'entry_price': current_price
-            }
-            
-        except BinanceAPIException as e:
-            logger.error(f"❌ Binance API Error: {e.message}")
-            return None
         except Exception as e:
             logger.error(f"❌ Order failed: {e}")
             return None
 
 # Initialize trader
 try:
-    trader = BinanceTrader()
+    trader = BybitTrader()
 except Exception as e:
     logger.error(f"❌ Failed to initialize trader: {e}")
     trader = None
@@ -342,19 +364,25 @@ def positions():
         if not trader:
             return jsonify({'error': 'Trader not initialized'}), 500
         
-        positions = trader.client.futures_position_information()
+        response = trader.client.get_positions(
+            category="linear"
+        )
         
-        # Filter only positions with non-zero amount
+        if response['retCode'] != 0:
+            return jsonify({'error': response['retMsg']}), 500
+        
+        # Filter only positions with non-zero size
         active_positions = [
             {
                 'symbol': p['symbol'],
-                'size': float(p['positionAmt']),
-                'entry_price': float(p['entryPrice']),
-                'unrealized_pnl': float(p['unRealizedProfit']),
-                'leverage': int(p['leverage'])
+                'size': float(p['size']),
+                'side': p['side'],
+                'entry_price': float(p['avgPrice']),
+                'unrealized_pnl': float(p['unrealisedPnl']),
+                'leverage': p['leverage']
             }
-            for p in positions
-            if float(p['positionAmt']) != 0
+            for p in response['result']['list']
+            if float(p['size']) > 0
         ]
         
         return jsonify({
@@ -371,7 +399,7 @@ def test():
     """Test endpoint"""
     return jsonify({
         'status': 'ok',
-        'message': 'Binance Webhook Server is running',
+        'message': 'Bybit Webhook Server is running',
         'testnet': trader.testnet if trader else None
     }), 200
 
