@@ -1,5 +1,4 @@
 flask==3.0.0
-alpaca-py==0.43.2
+python-binance==1.0.19
 python-dotenv==1.0.0
 gunicorn==21.2.0
-pytz==2024.2
