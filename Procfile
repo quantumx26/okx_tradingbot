@@ -1,1 +1,1 @@
-web: gunicorn binance_webhook_server:app --bind 0.0.0.0:$PORT
+web: gunicorn bybit_webhook_server:app --bind 0.0.0.0:$PORT
