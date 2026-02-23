@@ -226,13 +226,15 @@ class BinanceTrader:
             
             logger.info(f"✅ Stop Loss set at ${sl:.2f}")
             
-            # Place take profit order
+            # Place take profit order (using LIMIT instead of TAKE_PROFIT_MARKET)
             tp_order = self.client.futures_create_order(
                 symbol=symbol,
                 side=sl_side,
-                type='TAKE_PROFIT_MARKET',
-                stopPrice=tp,
-                closePosition=True
+                type='LIMIT',
+                price=tp,
+                quantity=position_size,
+                timeInForce='GTC',
+                reduceOnly=True
             )
             
             logger.info(f"✅ Take Profit set at ${tp:.2f}")
