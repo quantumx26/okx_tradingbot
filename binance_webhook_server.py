@@ -214,30 +214,65 @@ class BinanceTrader:
             
             logger.info(f"✅ Entry order placed: {order['orderId']}")
             
-            # Place stop loss order
+            # Place stop loss and take profit using CONDITIONAL orders
+            # These work better on Binance Testnet Futures
             sl_side = 'SELL' if signal == 'LONG' else 'BUY'
-            sl_order = self.client.futures_create_order(
-                symbol=symbol,
-                side=sl_side,
-                type='STOP_MARKET',
-                stopPrice=sl,
-                closePosition=True
-            )
             
-            logger.info(f"✅ Stop Loss set at ${sl:.2f}")
+            try:
+                # Stop Loss - using STOP_MARKET with conditional
+                sl_order = self.client.futures_create_order(
+                    symbol=symbol,
+                    side=sl_side,
+                    type='STOP_MARKET',
+                    stopPrice=sl,
+                    closePosition=True,
+                    workingType='MARK_PRICE'
+                )
+                logger.info(f"✅ Stop Loss set at ${sl:.2f}")
+            except BinanceAPIException as e:
+                logger.error(f"❌ Stop Loss failed: {e.message}")
+                # Try alternative method
+                try:
+                    sl_order = self.client.futures_create_order(
+                        symbol=symbol,
+                        side=sl_side,
+                        type='STOP',
+                        stopPrice=sl,
+                        price=sl,
+                        quantity=position_size,
+                        timeInForce='GTC'
+                    )
+                    logger.info(f"✅ Stop Loss set at ${sl:.2f} (alternative method)")
+                except Exception as e2:
+                    logger.error(f"❌ Stop Loss completely failed: {e2}")
             
-            # Place take profit order (using LIMIT instead of TAKE_PROFIT_MARKET)
-            tp_order = self.client.futures_create_order(
-                symbol=symbol,
-                side=sl_side,
-                type='LIMIT',
-                price=tp,
-                quantity=position_size,
-                timeInForce='GTC',
-                reduceOnly=True
-            )
-            
-            logger.info(f"✅ Take Profit set at ${tp:.2f}")
+            try:
+                # Take Profit - using TAKE_PROFIT_MARKET with conditional
+                tp_order = self.client.futures_create_order(
+                    symbol=symbol,
+                    side=sl_side,
+                    type='TAKE_PROFIT_MARKET',
+                    stopPrice=tp,
+                    closePosition=True,
+                    workingType='MARK_PRICE'
+                )
+                logger.info(f"✅ Take Profit set at ${tp:.2f}")
+            except BinanceAPIException as e:
+                logger.error(f"❌ Take Profit failed: {e.message}")
+                # Try alternative LIMIT method with post-only
+                try:
+                    tp_order = self.client.futures_create_order(
+                        symbol=symbol,
+                        side=sl_side,
+                        type='TAKE_PROFIT',
+                        stopPrice=tp,
+                        price=tp,
+                        quantity=position_size,
+                        timeInForce='GTC'
+                    )
+                    logger.info(f"✅ Take Profit set at ${tp:.2f} (alternative method)")
+                except Exception as e2:
+                    logger.error(f"❌ Take Profit completely failed: {e2}")
             
             return {
                 'entry_order': order,
