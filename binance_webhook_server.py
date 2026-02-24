@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 """
 Binance Futures Webhook Server for TradingView Alerts
-Supports: LONG + SHORT, Testnet & Live, Position Sizing, SL/TP Management
+Supports: LONG + SHORT, Testnet & Live, Position Sizing
+EXIT handled by TradingView webhooks (CLOSE_LONG/CLOSE_SHORT)
 """
 
 import os
 import sys
 import logging
-import hmac
-import hashlib
-import time
-import requests
 from datetime import datetime
 from flask import Flask, request, jsonify
 from binance.client import Client
@@ -155,56 +152,44 @@ class BinanceTrader:
             logger.error(f"❌ Error calculating position size: {e}")
             return None
     
-    def _create_algo_order(self, symbol, side, order_type, stop_price, quantity):
+    def close_position(self, symbol):
         """
-        Create algo order using manual API call (for Testnet compatibility)
-        Binance Testnet requires Algo Order API for Stop Loss / Take Profit
+        Close all positions for a symbol using MARKET order
+        This works on Testnet without Algo Order API
         """
         try:
-            base_url = 'https://testnet.binancefuture.com' if self.testnet else 'https://fapi.binance.com'
-            endpoint = '/fapi/v1/order'
+            # Get current position
+            positions = self.client.futures_position_information(symbol=symbol)
             
-            timestamp = int(time.time() * 1000)
-            
-            params = {
-                'symbol': symbol,
-                'side': side,
-                'type': order_type,
-                'quantity': quantity,
-                'stopPrice': stop_price,
-                'closePosition': 'true',
-                'timestamp': timestamp
-            }
-            
-            # Create signature
-            query_string = '&'.join([f"{k}={v}" for k, v in params.items()])
-            signature = hmac.new(
-                self.api_secret.encode('utf-8'),
-                query_string.encode('utf-8'),
-                hashlib.sha256
-            ).hexdigest()
-            
-            params['signature'] = signature
-            
-            headers = {
-                'X-MBX-APIKEY': self.api_key
-            }
-            
-            response = requests.post(
-                f"{base_url}{endpoint}",
-                params=params,
-                headers=headers,
-                timeout=10
-            )
-            
-            if response.status_code == 200:
-                return response.json()
-            else:
-                logger.error(f"Algo Order API Error: {response.text}")
-                return None
+            for pos in positions:
+                pos_amt = float(pos['positionAmt'])
                 
+                if pos_amt != 0:
+                    # Determine side to close
+                    side = 'SELL' if pos_amt > 0 else 'BUY'
+                    quantity = abs(pos_amt)
+                    
+                    logger.info(f"📤 Closing position: {quantity} {symbol} (Side: {side})")
+                    
+                    # Close with MARKET order
+                    order = self.client.futures_create_order(
+                        symbol=symbol,
+                        side=side,
+                        type='MARKET',
+                        quantity=quantity
+                    )
+                    
+                    logger.info(f"✅ Position closed: Order ID {order['orderId']}")
+                    return order
+                    
+            logger.warning(f"⚠️ No open position found for {symbol}")
+            return None
+            
+        except BinanceAPIException as e:
+            logger.error(f"❌ Binance API Error closing position: {e.message}")
+            return None
         except Exception as e:
-            logger.error(f"Error creating algo order: {e}")
+            logger.error(f"❌ Error closing position: {e}")
             return None
     
     def place_order(self, signal, symbol, entry, sl, tp, risk_usd):
@@ -270,54 +255,16 @@ class BinanceTrader:
             
             logger.info(f"✅ Entry order placed: {order['orderId']}")
             
-            # Place Stop Loss and Take Profit using manual Algo Order API
-            # Binance Testnet requires this endpoint for conditional orders
-            sl_side = 'SELL' if signal == 'LONG' else 'BUY'
-            
-            # Stop Loss
-            sl_type = 'STOP_MARKET'
-            sl_order = self._create_algo_order(
-                symbol=symbol,
-                side=sl_side,
-                order_type=sl_type,
-                stop_price=sl,
-                quantity=position_size
-            )
-            
-            if sl_order:
-                logger.info(f"✅ Stop Loss set at ${sl:.2f}")
-            else:
-                logger.error(f"❌ Stop Loss failed!")
-            
-            # Take Profit
-            tp_type = 'TAKE_PROFIT_MARKET'
-            tp_order = self._create_algo_order(
-                symbol=symbol,
-                side=sl_side,
-                order_type=tp_type,
-                stop_price=tp,
-                quantity=position_size
-            )
-            
-            if tp_order:
-                logger.info(f"✅ Take Profit set at ${tp:.2f}")
-            else:
-                logger.error(f"❌ Take Profit failed!")
-            
-            # Check if exit orders succeeded
-            if not sl_order and not tp_order:
-                logger.error("⚠️ CRITICAL: NO EXIT ORDERS SET! Position unprotected!")
-            elif not sl_order:
-                logger.warning("⚠️ WARNING: Stop Loss not set! Only Take Profit active.")
-            elif not tp_order:
-                logger.warning("⚠️ WARNING: Take Profit not set! Only Stop Loss active.")
+            logger.info("ℹ️  Stop Loss and Take Profit will be managed by TradingView EXIT webhooks")
+            logger.info(f"   Expected TP: ${tp:.2f}, Expected SL: ${sl:.2f}")
             
             return {
                 'entry_order': order,
-                'sl_order': sl_order,
-                'tp_order': tp_order,
+                'sl_order': None,
+                'tp_order': None,
                 'position_size': position_size,
-                'entry_price': current_price
+                'entry_price': current_price,
+                'note': 'SL/TP managed by TradingView webhooks'
             }
             
         except BinanceAPIException as e:
@@ -353,6 +300,37 @@ def webhook():
         # Extract signal data
         signal = data.get('signal')
         symbol = data.get('symbol')
+        
+        # Handle CLOSE signals (EXIT)
+        if signal == 'CLOSE_LONG':
+            logger.info(f"📤 EXIT Signal: Close LONG position for {symbol}")
+            result = trader.close_position(symbol)
+            
+            if result:
+                return jsonify({
+                    'status': 'success',
+                    'action': 'close_long',
+                    'symbol': symbol,
+                    'order_id': result.get('orderId')
+                }), 200
+            else:
+                return jsonify({'error': 'Failed to close position'}), 500
+                
+        elif signal == 'CLOSE_SHORT':
+            logger.info(f"📤 EXIT Signal: Close SHORT position for {symbol}")
+            result = trader.close_position(symbol)
+            
+            if result:
+                return jsonify({
+                    'status': 'success',
+                    'action': 'close_short',
+                    'symbol': symbol,
+                    'order_id': result.get('orderId')
+                }), 200
+            else:
+                return jsonify({'error': 'Failed to close position'}), 500
+        
+        # Handle ENTRY signals (existing logic)
         entry = float(data.get('entry', 0))
         sl = float(data.get('sl', 0))
         tp = float(data.get('tp', 0))
