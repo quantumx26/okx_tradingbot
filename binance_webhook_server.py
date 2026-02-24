@@ -7,6 +7,10 @@ Supports: LONG + SHORT, Testnet & Live, Position Sizing, SL/TP Management
 import os
 import sys
 import logging
+import hmac
+import hashlib
+import time
+import requests
 from datetime import datetime
 from flask import Flask, request, jsonify
 from binance.client import Client
@@ -151,6 +155,58 @@ class BinanceTrader:
             logger.error(f"❌ Error calculating position size: {e}")
             return None
     
+    def _create_algo_order(self, symbol, side, order_type, stop_price, quantity):
+        """
+        Create algo order using manual API call (for Testnet compatibility)
+        Binance Testnet requires Algo Order API for Stop Loss / Take Profit
+        """
+        try:
+            base_url = 'https://testnet.binancefuture.com' if self.testnet else 'https://fapi.binance.com'
+            endpoint = '/fapi/v1/order'
+            
+            timestamp = int(time.time() * 1000)
+            
+            params = {
+                'symbol': symbol,
+                'side': side,
+                'type': order_type,
+                'quantity': quantity,
+                'stopPrice': stop_price,
+                'closePosition': 'true',
+                'timestamp': timestamp
+            }
+            
+            # Create signature
+            query_string = '&'.join([f"{k}={v}" for k, v in params.items()])
+            signature = hmac.new(
+                self.api_secret.encode('utf-8'),
+                query_string.encode('utf-8'),
+                hashlib.sha256
+            ).hexdigest()
+            
+            params['signature'] = signature
+            
+            headers = {
+                'X-MBX-APIKEY': self.api_key
+            }
+            
+            response = requests.post(
+                f"{base_url}{endpoint}",
+                params=params,
+                headers=headers,
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                return response.json()
+            else:
+                logger.error(f"Algo Order API Error: {response.text}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error creating algo order: {e}")
+            return None
+    
     def place_order(self, signal, symbol, entry, sl, tp, risk_usd):
         """
         Place market order with stop loss and take profit
@@ -214,65 +270,47 @@ class BinanceTrader:
             
             logger.info(f"✅ Entry order placed: {order['orderId']}")
             
-            # Place stop loss and take profit using CONDITIONAL orders
-            # These work better on Binance Testnet Futures
+            # Place Stop Loss and Take Profit using manual Algo Order API
+            # Binance Testnet requires this endpoint for conditional orders
             sl_side = 'SELL' if signal == 'LONG' else 'BUY'
             
-            try:
-                # Stop Loss - using STOP_MARKET with conditional
-                sl_order = self.client.futures_create_order(
-                    symbol=symbol,
-                    side=sl_side,
-                    type='STOP_MARKET',
-                    stopPrice=sl,
-                    closePosition=True,
-                    workingType='MARK_PRICE'
-                )
-                logger.info(f"✅ Stop Loss set at ${sl:.2f}")
-            except BinanceAPIException as e:
-                logger.error(f"❌ Stop Loss failed: {e.message}")
-                # Try alternative method
-                try:
-                    sl_order = self.client.futures_create_order(
-                        symbol=symbol,
-                        side=sl_side,
-                        type='STOP',
-                        stopPrice=sl,
-                        price=sl,
-                        quantity=position_size,
-                        timeInForce='GTC'
-                    )
-                    logger.info(f"✅ Stop Loss set at ${sl:.2f} (alternative method)")
-                except Exception as e2:
-                    logger.error(f"❌ Stop Loss completely failed: {e2}")
+            # Stop Loss
+            sl_type = 'STOP_MARKET'
+            sl_order = self._create_algo_order(
+                symbol=symbol,
+                side=sl_side,
+                order_type=sl_type,
+                stop_price=sl,
+                quantity=position_size
+            )
             
-            try:
-                # Take Profit - using TAKE_PROFIT_MARKET with conditional
-                tp_order = self.client.futures_create_order(
-                    symbol=symbol,
-                    side=sl_side,
-                    type='TAKE_PROFIT_MARKET',
-                    stopPrice=tp,
-                    closePosition=True,
-                    workingType='MARK_PRICE'
-                )
+            if sl_order:
+                logger.info(f"✅ Stop Loss set at ${sl:.2f}")
+            else:
+                logger.error(f"❌ Stop Loss failed!")
+            
+            # Take Profit
+            tp_type = 'TAKE_PROFIT_MARKET'
+            tp_order = self._create_algo_order(
+                symbol=symbol,
+                side=sl_side,
+                order_type=tp_type,
+                stop_price=tp,
+                quantity=position_size
+            )
+            
+            if tp_order:
                 logger.info(f"✅ Take Profit set at ${tp:.2f}")
-            except BinanceAPIException as e:
-                logger.error(f"❌ Take Profit failed: {e.message}")
-                # Try alternative LIMIT method with post-only
-                try:
-                    tp_order = self.client.futures_create_order(
-                        symbol=symbol,
-                        side=sl_side,
-                        type='TAKE_PROFIT',
-                        stopPrice=tp,
-                        price=tp,
-                        quantity=position_size,
-                        timeInForce='GTC'
-                    )
-                    logger.info(f"✅ Take Profit set at ${tp:.2f} (alternative method)")
-                except Exception as e2:
-                    logger.error(f"❌ Take Profit completely failed: {e2}")
+            else:
+                logger.error(f"❌ Take Profit failed!")
+            
+            # Check if exit orders succeeded
+            if not sl_order and not tp_order:
+                logger.error("⚠️ CRITICAL: NO EXIT ORDERS SET! Position unprotected!")
+            elif not sl_order:
+                logger.warning("⚠️ WARNING: Stop Loss not set! Only Take Profit active.")
+            elif not tp_order:
+                logger.warning("⚠️ WARNING: Take Profit not set! Only Stop Loss active.")
             
             return {
                 'entry_order': order,
