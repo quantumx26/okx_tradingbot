@@ -214,7 +214,7 @@ class BinanceTrader:
                 return None
             
             # Calculate position size
-            position_size = self.calculate_position_size(symbol, current_price, sl, risk_usd)
+            position_size = self.calculate_position_size(symbol, entry, sl, risk_usd)
             if not position_size:
                 return None
             
