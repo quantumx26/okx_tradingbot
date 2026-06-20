@@ -2,11 +2,14 @@
 """
 Binance Futures Webhook Server for TradingView Alerts
 Supports: LONG + SHORT, Testnet & Live, Position Sizing (mit Leverage-Cap)
+Entry: LIMIT Order mit Slippage-Toleranz (statt Market Order)
 EXIT handled by TradingView webhooks (CLOSE_LONG/CLOSE_SHORT)
 """
 
 import os
 import sys
+import time
+import threading
 import logging
 from datetime import datetime
 from flask import Flask, request, jsonify
@@ -14,10 +17,8 @@ from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from dotenv import load_dotenv
 
-# Load environment variables
 load_dotenv()
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -31,9 +32,14 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
+# ── Konfiguration Limit-Entry ───────────────────────────────────────────────
+ENTRY_SLIPPAGE_TOLERANCE = float(os.getenv('ENTRY_SLIPPAGE_TOLERANCE', '0.001'))  # 0.1% Standard
+ENTRY_FILL_TIMEOUT_SECONDS = int(os.getenv('ENTRY_FILL_TIMEOUT_SECONDS', '300'))  # 5 Minuten Standard
+ENTRY_FILL_POLL_INTERVAL = 0.5  # Sekunden zwischen Fill-Checks
+
+
 class BinanceTrader:
     def __init__(self):
-        """Initialize Binance client with API credentials"""
         self.api_key = os.getenv('BINANCE_API_KEY')
         self.api_secret = os.getenv('BINANCE_SECRET_KEY')
         self.testnet = os.getenv('BINANCE_TESTNET', 'true').lower() == 'true'
@@ -43,7 +49,6 @@ class BinanceTrader:
             logger.error("❌ Missing required environment variables!")
             raise ValueError("BINANCE_API_KEY, BINANCE_SECRET_KEY, and WEBHOOK_SECRET must be set")
 
-        # Initialize Binance client
         try:
             if self.testnet:
                 logger.info("🧪 Binance TESTNET Mode ENABLED")
@@ -52,26 +57,25 @@ class BinanceTrader:
                     self.api_secret,
                     testnet=True
                 )
-                # Set testnet URL
                 self.client.API_URL = 'https://testnet.binancefuture.com'
             else:
                 logger.info("💰 Binance LIVE Mode ENABLED")
                 self.client = Client(self.api_key, self.api_secret)
 
-            # Test connection
             account = self.client.futures_account()
             balance = float(account['totalWalletBalance'])
 
             logger.info("✅ Connected to Binance successfully")
             logger.info(f"   Account Balance: ${balance:.2f} USDT")
             logger.info(f"   Testnet: {self.testnet}")
+            logger.info(f"   Entry Slippage Tolerance: {ENTRY_SLIPPAGE_TOLERANCE*100:.2f}%")
+            logger.info(f"   Entry Fill Timeout: {ENTRY_FILL_TIMEOUT_SECONDS}s")
 
         except Exception as e:
             logger.error(f"❌ Failed to connect to Binance: {e}")
             raise
 
     def get_account_info(self):
-        """Get account balance and info"""
         try:
             account = self.client.futures_account()
             balance = float(account['totalWalletBalance'])
@@ -87,7 +91,6 @@ class BinanceTrader:
             return None
 
     def get_current_price(self, symbol):
-        """Get current market price for symbol"""
         try:
             ticker = self.client.futures_symbol_ticker(symbol=symbol)
             return float(ticker['price'])
@@ -95,18 +98,42 @@ class BinanceTrader:
             logger.error(f"❌ Error getting price for {symbol}: {e}")
             return None
 
+    def get_symbol_precision(self, symbol):
+        """Get quantity AND price precision/tick size for a symbol"""
+        try:
+            exchange_info = self.client.futures_exchange_info()
+            symbol_info = next(
+                (s for s in exchange_info['symbols'] if s['symbol'] == symbol),
+                None
+            )
+            if not symbol_info:
+                return None, None, None, None
+
+            quantity_precision = symbol_info['quantityPrecision']
+            price_precision = symbol_info['pricePrecision']
+
+            tick_size = None
+            for f in symbol_info['filters']:
+                if f['filterType'] == 'PRICE_FILTER':
+                    tick_size = float(f['tickSize'])
+                    break
+
+            return symbol_info, quantity_precision, price_precision, tick_size
+        except Exception as e:
+            logger.error(f"❌ Error getting symbol precision: {e}")
+            return None, None, None, None
+
+    def round_to_tick(self, price, tick_size):
+        """Round price to the symbol's allowed tick size"""
+        if not tick_size or tick_size == 0:
+            return price
+        return round(round(price / tick_size) * tick_size, 8)
+
     def calculate_position_size(self, symbol, entry_price, stop_loss, risk_usd):
         """
         Calculate position size based on risk AND available margin.
-
-        Wichtig: Bei sehr engem SL (z.B. nur 0.04% vom Entry entfernt) kann die
-        reine Risk-Formel (risk_usd / risk_per_unit) eine riesige Positionsgroesse
-        ergeben, die weit ueber das verfuegbare Kapital hinausgeht ("Margin is
-        insufficient"). Deshalb wird die Position zusaetzlich anhand des
-        Kontostands und Hebels gedeckelt.
         """
         try:
-            # Get symbol info for precision
             exchange_info = self.client.futures_exchange_info()
             symbol_info = next(
                 (s for s in exchange_info['symbols'] if s['symbol'] == symbol),
@@ -119,24 +146,19 @@ class BinanceTrader:
 
             quantity_precision = symbol_info['quantityPrecision']
 
-            # Calculate risk per unit
             risk_per_unit = abs(entry_price - stop_loss)
 
             if risk_per_unit <= 0:
                 logger.error("❌ Invalid Stop Loss")
                 return None
 
-            # Risk based position size
             position_size = risk_usd / risk_per_unit
 
-            # Get account balance
             account = self.client.futures_account()
             available_balance = float(account['availableBalance'])
 
-            # Use leverage
             leverage = 20
 
-            # Maximum position allowed by account size
             max_position_value = available_balance * leverage * 0.95
             max_position_size = max_position_value / entry_price
 
@@ -146,10 +168,8 @@ class BinanceTrader:
                 )
                 position_size = max_position_size
 
-            # Round
             position_size = round(position_size, quantity_precision)
 
-            # Binance minimum notional
             min_notional = 5.0
             notional_value = position_size * entry_price
 
@@ -177,24 +197,21 @@ class BinanceTrader:
 
     def close_position(self, symbol):
         """
-        Close all positions for a symbol using MARKET order
-        This works on Testnet without Algo Order API
+        Close all positions for a symbol using MARKET order.
+        (Exit bleibt Market — hier zaehlt schnelles Rauskommen mehr als Slippage-Schutz)
         """
         try:
-            # Get current position
             positions = self.client.futures_position_information(symbol=symbol)
 
             for pos in positions:
                 pos_amt = float(pos['positionAmt'])
 
                 if pos_amt != 0:
-                    # Determine side to close
                     side = 'SELL' if pos_amt > 0 else 'BUY'
                     quantity = abs(pos_amt)
 
                     logger.info(f"📤 Closing position: {quantity} {symbol} (Side: {side})")
 
-                    # Close with MARKET order
                     order = self.client.futures_create_order(
                         symbol=symbol,
                         side=side,
@@ -215,43 +232,110 @@ class BinanceTrader:
             logger.error(f"❌ Error closing position: {e}")
             return None
 
+    def monitor_and_cancel_if_unfilled(self, symbol, order_id, timeout_seconds, signal, entry, sl, tp, position_size):
+        """
+        Laeuft in einem Hintergrund-Thread: wartet bis zu `timeout_seconds`,
+        prueft dann den Order-Status und storniert die Order falls sie noch
+        nicht (vollstaendig) gefuellt ist. Blockiert NICHT den Webhook-Request.
+        """
+        poll_interval = 2.0
+        elapsed = 0.0
+
+        while elapsed < timeout_seconds:
+            try:
+                order = self.client.futures_get_order(symbol=symbol, orderId=order_id)
+                status = order.get('status')
+
+                if status == 'FILLED':
+                    fill_price = float(order.get('avgPrice', 0))
+                    slippage = abs(fill_price - entry) if fill_price else 0
+                    logger.info(f"✅ [Background] Entry order FILLED: {order_id}")
+                    logger.info(f"   Fill Price: ${fill_price:.2f}")
+                    logger.info(f"   Slippage vs Signal-Entry: ${slippage:.2f}")
+                    logger.info("ℹ️  Stop Loss and Take Profit will be managed by TradingView EXIT webhooks")
+                    logger.info(f"   Expected TP: ${tp:.2f}, Expected SL: ${sl:.2f}")
+                    return
+
+                if status in ('CANCELED', 'EXPIRED', 'REJECTED'):
+                    logger.info(f"ℹ️ [Background] Order {order_id} bereits beendet (Status: {status}), kein Cancel noetig")
+                    return
+
+            except Exception as e:
+                logger.warning(f"⚠️ [Background] Fehler beim Status-Check: {e}")
+
+            time.sleep(poll_interval)
+            elapsed += poll_interval
+
+        # Timeout erreicht — finalen Status pruefen und ggf. stornieren
+        try:
+            order = self.client.futures_get_order(symbol=symbol, orderId=order_id)
+            status = order.get('status')
+
+            if status == 'FILLED':
+                fill_price = float(order.get('avgPrice', 0))
+                logger.info(f"✅ [Background] Order doch noch gefuellt kurz vor Timeout: {order_id} @ ${fill_price:.2f}")
+                return
+
+            if status in ('CANCELED', 'EXPIRED', 'REJECTED'):
+                logger.info(f"ℹ️ [Background] Order {order_id} bereits beendet (Status: {status})")
+                return
+
+            logger.warning(f"⏱️ [Background] {timeout_seconds}s Timeout erreicht — storniere unfilled Order {order_id} (Status: {status})")
+            self.client.futures_cancel_order(symbol=symbol, orderId=order_id)
+            logger.info(f"🧹 [Background] Order erfolgreich storniert: {order_id}")
+
+        except Exception as e:
+            logger.warning(f"⚠️ [Background] Konnte Order nicht stornieren (evtl. bereits gefuellt/inaktiv): {e}")
+
     def place_order(self, signal, symbol, entry, sl, tp, risk_usd):
         """
-        Place market order with stop loss and take profit
+        Place a LIMIT entry order with a small slippage tolerance buffer.
+        Der Webhook-Request antwortet SOFORT nach dem Platzieren der Order,
+        ein Hintergrund-Thread ueberwacht den Fill-Status und storniert die
+        Order automatisch nach ENTRY_FILL_TIMEOUT_SECONDS (Standard 5 Min)
+        falls sie bis dahin nicht gefuellt wurde.
 
-        Args:
-            signal: 'LONG' or 'SHORT'
-            symbol: Trading pair (e.g., 'BTCUSDT')
-            entry: Entry price (for reference)
-            sl: Stop loss price
-            tp: Take profit price
-            risk_usd: Risk amount in USD
+        Long:  Limit-Preis = entry * (1 + TOLERANCE)  -> bereit etwas mehr zu zahlen
+        Short: Limit-Preis = entry * (1 - TOLERANCE)  -> bereit etwas weniger zu bekommen
 
-        Returns:
-            Order response or None
+        Das deckelt die maximale Slippage exakt auf die Toleranz, statt wie bei
+        Market Orders unbegrenzt offen zu sein.
         """
         try:
-            # Get current price for entry
             current_price = self.get_current_price(symbol)
             if not current_price:
                 return None
 
-            # Calculate position size (mit Leverage-Cap, basiert auf entry-Preis aus dem Webhook)
             position_size = self.calculate_position_size(symbol, entry, sl, risk_usd)
             if not position_size:
                 return None
 
-            # Determine side
+            symbol_info, quantity_precision, price_precision, tick_size = self.get_symbol_precision(symbol)
+            if symbol_info is None:
+                logger.error(f"❌ Could not load symbol precision for {symbol}")
+                return None
+
             side = 'BUY' if signal == 'LONG' else 'SELL'
 
-            logger.info(f"📊 Placing {signal} order for {symbol}")
+            # Limit-Preis mit Toleranz-Puffer berechnen
+            if signal == 'LONG':
+                limit_price = entry * (1 + ENTRY_SLIPPAGE_TOLERANCE)
+            else:
+                limit_price = entry * (1 - ENTRY_SLIPPAGE_TOLERANCE)
+
+            limit_price = self.round_to_tick(limit_price, tick_size)
+
+            logger.info(f"📊 Placing {signal} LIMIT order for {symbol}")
             logger.info(f"   Side: {side}")
             logger.info(f"   Quantity: {position_size}")
-            logger.info(f"   Entry: ${current_price:.2f}")
+            logger.info(f"   Signal Entry: ${entry:.2f}")
+            logger.info(f"   Current Price: ${current_price:.2f}")
+            logger.info(f"   Limit Price (mit {ENTRY_SLIPPAGE_TOLERANCE*100:.2f}% Toleranz): ${limit_price:.2f}")
             logger.info(f"   Stop Loss: ${sl:.2f}")
             logger.info(f"   Take Profit: ${tp:.2f}")
+            logger.info(f"   Unfilled-Timeout: {ENTRY_FILL_TIMEOUT_SECONDS}s ({ENTRY_FILL_TIMEOUT_SECONDS/60:.1f} Min)")
 
-            # Close any existing positions for this symbol first
+            # Bestehende Positionen zuerst schliessen
             try:
                 positions = self.client.futures_position_information(symbol=symbol)
                 for pos in positions:
@@ -268,26 +352,35 @@ class BinanceTrader:
             except Exception as e:
                 logger.warning(f"⚠️ Error checking/closing positions: {e}")
 
-            # Place market entry order
+            # LIMIT Entry Order platzieren
             order = self.client.futures_create_order(
                 symbol=symbol,
                 side=side,
-                type='MARKET',
-                quantity=position_size
+                type='LIMIT',
+                price=limit_price,
+                quantity=position_size,
+                timeInForce='GTC'
             )
 
-            logger.info(f"✅ Entry order placed: {order['orderId']}")
+            logger.info(f"📝 Limit order placed: {order['orderId']}")
+            logger.info(f"   Ueberwachung laeuft im Hintergrund (Auto-Cancel nach {ENTRY_FILL_TIMEOUT_SECONDS}s falls unfilled)")
 
-            logger.info("ℹ️  Stop Loss and Take Profit will be managed by TradingView EXIT webhooks")
-            logger.info(f"   Expected TP: ${tp:.2f}, Expected SL: ${sl:.2f}")
+            # Hintergrund-Thread starten, der die Order ueberwacht und ggf. storniert
+            monitor_thread = threading.Thread(
+                target=self.monitor_and_cancel_if_unfilled,
+                args=(symbol, order['orderId'], ENTRY_FILL_TIMEOUT_SECONDS, signal, entry, sl, tp, position_size),
+                daemon=True
+            )
+            monitor_thread.start()
 
+            # Sofort zurueckgeben — der Fill wird im Hintergrund-Thread bestaetigt/storniert
             return {
                 'entry_order': order,
                 'sl_order': None,
                 'tp_order': None,
                 'position_size': position_size,
-                'entry_price': current_price,
-                'note': 'SL/TP managed by TradingView webhooks'
+                'entry_price': limit_price,
+                'note': f'LIMIT order placed, monitored in background for {ENTRY_FILL_TIMEOUT_SECONDS}s'
             }
 
         except BinanceAPIException as e:
@@ -297,6 +390,7 @@ class BinanceTrader:
             logger.error(f"❌ Order failed: {e}")
             return None
 
+
 # Initialize trader
 try:
     trader = BinanceTrader()
@@ -304,32 +398,28 @@ except Exception as e:
     logger.error(f"❌ Failed to initialize trader: {e}")
     trader = None
 
+
 @app.route('/webhook', methods=['POST'])
 def webhook():
     """Handle TradingView webhook alerts"""
     try:
-        # Guard: falls die Binance-Verbindung beim Start fehlgeschlagen ist
         if trader is None:
             logger.error("❌ Trader not initialized — check Binance API credentials / connection")
             return jsonify({'error': 'Trader not initialized — check server logs'}), 500
 
-        # Get JSON data
         data = request.get_json()
 
         if not data:
             logger.error("❌ No JSON data received")
             return jsonify({'error': 'No data'}), 400
 
-        # Verify webhook secret
         if data.get('secret') != trader.webhook_secret:
             logger.error("❌ Invalid webhook secret")
             return jsonify({'error': 'Unauthorized'}), 401
 
-        # Extract signal data
         signal = data.get('signal')
         symbol = data.get('symbol')
 
-        # Handle CLOSE signals (EXIT)
         if signal == 'CLOSE_LONG':
             logger.info(f"📤 EXIT Signal: Close LONG position for {symbol}")
             result = trader.close_position(symbol)
@@ -358,7 +448,6 @@ def webhook():
             else:
                 return jsonify({'error': 'Failed to close position'}), 500
 
-        # Handle ENTRY signals (existing logic)
         entry = float(data.get('entry', 0))
         sl = float(data.get('sl', 0))
         tp = float(data.get('tp', 0))
@@ -367,7 +456,6 @@ def webhook():
         logger.info(f"📊 Webhook: {signal} {symbol}")
         logger.info(f"   Entry: {entry}, SL: {sl}, TP: {tp}")
 
-        # Validate data
         if not all([signal, symbol, entry, sl, tp]):
             logger.error("❌ Missing required fields")
             return jsonify({'error': 'Missing fields'}), 400
@@ -376,7 +464,6 @@ def webhook():
             logger.error(f"❌ Invalid signal: {signal}")
             return jsonify({'error': 'Invalid signal'}), 400
 
-        # Place order
         result = trader.place_order(signal, symbol, entry, sl, tp, risk_usd)
 
         if result:
@@ -388,11 +475,12 @@ def webhook():
                 'entry_price': result['entry_price']
             }), 200
         else:
-            return jsonify({'error': 'Order failed'}), 500
+            return jsonify({'error': 'Order failed or not filled within tolerance/timeout'}), 500
 
     except Exception as e:
         logger.error(f"❌ Webhook error: {e}")
         return jsonify({'error': str(e)}), 500
+
 
 @app.route('/status', methods=['GET'])
 def status():
@@ -409,12 +497,15 @@ def status():
             'testnet': trader.testnet,
             'account': account,
             'btc_price': btc_price,
+            'entry_slippage_tolerance': ENTRY_SLIPPAGE_TOLERANCE,
+            'entry_fill_timeout_seconds': ENTRY_FILL_TIMEOUT_SECONDS,
             'timestamp': datetime.utcnow().isoformat()
         }), 200
 
     except Exception as e:
         logger.error(f"❌ Status error: {e}")
         return jsonify({'error': str(e)}), 500
+
 
 @app.route('/positions', methods=['GET'])
 def positions():
@@ -425,7 +516,6 @@ def positions():
 
         positions = trader.client.futures_position_information()
 
-        # Filter only positions with non-zero amount
         active_positions = [
             {
                 'symbol': p['symbol'],
@@ -447,6 +537,7 @@ def positions():
         logger.error(f"❌ Positions error: {e}")
         return jsonify({'error': str(e)}), 500
 
+
 @app.route('/test', methods=['GET'])
 def test():
     """Test endpoint"""
@@ -455,6 +546,7 @@ def test():
         'message': 'Binance Webhook Server is running',
         'testnet': trader.testnet if trader else None
     }), 200
+
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 10000))
