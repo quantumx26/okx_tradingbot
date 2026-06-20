@@ -2,7 +2,7 @@
 """
 Binance Futures Webhook Server for TradingView Alerts
 Supports: LONG + SHORT, Testnet & Live, Position Sizing (mit Leverage-Cap)
-Entry: LIMIT Order mit Slippage-Toleranz (statt Market Order)
+Entry: LIMIT Order exakt auf Signal-Entry-Preis (kein Slippage-Puffer)
 EXIT handled by TradingView webhooks (CLOSE_LONG/CLOSE_SHORT)
 """
 
@@ -33,10 +33,8 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # ── Konfiguration Limit-Entry ───────────────────────────────────────────────
-ENTRY_SLIPPAGE_TOLERANCE = float(os.getenv('ENTRY_SLIPPAGE_TOLERANCE', '0.001'))  # 0.1% Standard
 ENTRY_FILL_TIMEOUT_SECONDS = int(os.getenv('ENTRY_FILL_TIMEOUT_SECONDS', '300'))  # 5 Minuten Standard
 ENTRY_FILL_POLL_INTERVAL = 0.5  # Sekunden zwischen Fill-Checks
-MAX_FILL_DEVIATION = float(os.getenv('MAX_FILL_DEVIATION', '0.0015'))  # 0.15% — Sicherheitsnetz
 
 
 class BinanceTrader:
@@ -69,9 +67,7 @@ class BinanceTrader:
             logger.info("✅ Connected to Binance successfully")
             logger.info(f"   Account Balance: ${balance:.2f} USDT")
             logger.info(f"   Testnet: {self.testnet}")
-            logger.info(f"   Entry Slippage Tolerance: {ENTRY_SLIPPAGE_TOLERANCE*100:.2f}%")
             logger.info(f"   Entry Fill Timeout: {ENTRY_FILL_TIMEOUT_SECONDS}s")
-            logger.info(f"   Max Fill Deviation (Sicherheitsnetz): {MAX_FILL_DEVIATION*100:.2f}%")
 
         except Exception as e:
             logger.error(f"❌ Failed to connect to Binance: {e}")
@@ -239,15 +235,6 @@ class BinanceTrader:
         Laeuft in einem Hintergrund-Thread: wartet bis zu `timeout_seconds`,
         prueft dann den Order-Status und storniert die Order falls sie noch
         nicht (vollstaendig) gefuellt ist. Blockiert NICHT den Webhook-Request.
-
-        SICHERHEITS-CHECK: Falls die Order gefuellt wird, aber der echte
-        Fill-Preis zu stark vom Signal-Entry abweicht (mehr als
-        MAX_FILL_DEVIATION), wird die Position SOFORT wieder geschlossen.
-        Grund: SL/TP werden NICHT als echte Binance-Orders gesetzt, sondern
-        nur von TradingView anhand des Signal-Entry simuliert. Weicht der
-        echte Fill zu stark ab, passen SL/TP nicht mehr zur echten Position
-        (z.B. SL liegt dann ueber dem Entry bei einem Long) -> Position waere
-        de facto ungeschuetzt bis zum naechsten TradingView-Signal.
         """
         poll_interval = 2.0
         elapsed = 0.0
@@ -258,7 +245,7 @@ class BinanceTrader:
                 status = order.get('status')
 
                 if status == 'FILLED':
-                    self._handle_fill(symbol, order, signal, entry, sl, tp)
+                    logger.info(f"✅ Order filled: {order_id}")
                     return
 
                 if status in ('CANCELED', 'EXPIRED', 'REJECTED'):
@@ -277,8 +264,7 @@ class BinanceTrader:
             status = order.get('status')
 
             if status == 'FILLED':
-                logger.info(f"✅ [Background] Order doch noch gefuellt kurz vor Timeout: {order_id}")
-                self._handle_fill(symbol, order, signal, entry, sl, tp)
+                logger.info(f"✅ [Background] Order filled: {order_id}")
                 return
 
             if status in ('CANCELED', 'EXPIRED', 'REJECTED'):
@@ -292,53 +278,16 @@ class BinanceTrader:
         except Exception as e:
             logger.warning(f"⚠️ [Background] Konnte Order nicht stornieren (evtl. bereits gefuellt/inaktiv): {e}")
 
-    def _handle_fill(self, symbol, order, signal, entry, sl, tp):
-        """
-        Wird aufgerufen sobald eine Entry-Order gefuellt wurde.
-        Prueft ob der echte Fill-Preis zu stark vom Signal-Entry abweicht.
-        Falls ja: Position SOFORT wieder schliessen (Sicherheitsnetz).
-        """
-        order_id = order.get('orderId')
-        fill_price = float(order.get('avgPrice', 0))
-        if fill_price == 0:
-            fill_price = float(order.get('price', entry))
-
-        deviation = abs(fill_price - entry)
-        deviation_pct = deviation / entry
-
-        logger.info(f"✅ [Background] Entry order FILLED: {order_id}")
-        logger.info(f"   Signal Entry: ${entry:.2f}")
-        logger.info(f"   Fill Price: ${fill_price:.2f}")
-        logger.info(f"   Abweichung: ${deviation:.2f} ({deviation_pct*100:.3f}%)")
-
-        if deviation_pct > MAX_FILL_DEVIATION:
-            logger.error(f"🚨 [Background] Fill weicht zu stark ab! ({deviation_pct*100:.3f}% > Limit {MAX_FILL_DEVIATION*100:.3f}%)")
-            logger.error(f"🚨 [Background] SL/TP wuerden nicht mehr zur echten Position passen — schliesse SOFORT wieder!")
-            close_result = self.close_position(symbol)
-            if close_result:
-                logger.warning(f"🛡️ [Background] Position aus Sicherheitsgruenden geschlossen: {close_result.get('orderId')}")
-            else:
-                logger.error(f"❌ [Background] KONNTE Position NICHT automatisch schliessen — manuell pruefen!")
-            return
-
-        logger.info("ℹ️  Stop Loss and Take Profit will be managed by TradingView EXIT webhooks")
-        logger.info(f"   Expected TP: ${tp:.2f}, Expected SL: ${sl:.2f}")
-
     def place_order(self, signal, symbol, entry, sl, tp, risk_usd):
         """
-        Place a LIMIT entry order with a small slippage tolerance buffer.
+        Place a LIMIT entry order exakt auf dem Signal-Entry-Preis.
         Der Webhook-Request antwortet SOFORT nach dem Platzieren der Order,
         ein Hintergrund-Thread ueberwacht den Fill-Status und storniert die
         Order automatisch nach ENTRY_FILL_TIMEOUT_SECONDS (Standard 5 Min)
-        falls sie bis dahin nicht gefuellt wurde. Falls die Order zu einem
-        Preis fuellt der zu stark vom Signal-Entry abweicht, wird die
-        Position automatisch wieder geschlossen (siehe _handle_fill).
+        falls sie bis dahin nicht gefuellt wurde.
 
-        Long:  Limit-Preis = entry * (1 + TOLERANCE)  -> bereit etwas mehr zu zahlen
-        Short: Limit-Preis = entry * (1 - TOLERANCE)  -> bereit etwas weniger zu bekommen
-
-        Das deckelt die maximale Slippage exakt auf die Toleranz, statt wie bei
-        Market Orders unbegrenzt offen zu sein.
+        Long:  Limit-Preis = entry
+        Short: Limit-Preis = entry
         """
         try:
             current_price = self.get_current_price(symbol)
@@ -356,20 +305,15 @@ class BinanceTrader:
 
             side = 'BUY' if signal == 'LONG' else 'SELL'
 
-            # Limit-Preis mit Toleranz-Puffer berechnen
-            if signal == 'LONG':
-                limit_price = entry * (1 + ENTRY_SLIPPAGE_TOLERANCE)
-            else:
-                limit_price = entry * (1 - ENTRY_SLIPPAGE_TOLERANCE)
-
-            limit_price = self.round_to_tick(limit_price, tick_size)
+            # Limit-Preis exakt auf Signal-Entry setzen (kein Slippage-Puffer)
+            limit_price = self.round_to_tick(entry, tick_size)
 
             logger.info(f"📊 Placing {signal} LIMIT order for {symbol}")
             logger.info(f"   Side: {side}")
             logger.info(f"   Quantity: {position_size}")
             logger.info(f"   Signal Entry: ${entry:.2f}")
             logger.info(f"   Current Price: ${current_price:.2f}")
-            logger.info(f"   Limit Price (mit {ENTRY_SLIPPAGE_TOLERANCE*100:.2f}% Toleranz): ${limit_price:.2f}")
+            logger.info(f"   Limit Price (exakt): ${limit_price:.2f}")
             logger.info(f"   Stop Loss: ${sl:.2f}")
             logger.info(f"   Take Profit: ${tp:.2f}")
             logger.info(f"   Unfilled-Timeout: {ENTRY_FILL_TIMEOUT_SECONDS}s ({ENTRY_FILL_TIMEOUT_SECONDS/60:.1f} Min)")
@@ -536,7 +480,6 @@ def status():
             'testnet': trader.testnet,
             'account': account,
             'btc_price': btc_price,
-            'entry_slippage_tolerance': ENTRY_SLIPPAGE_TOLERANCE,
             'entry_fill_timeout_seconds': ENTRY_FILL_TIMEOUT_SECONDS,
             'timestamp': datetime.utcnow().isoformat()
         }), 200
